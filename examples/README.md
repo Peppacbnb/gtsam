@@ -23,6 +23,7 @@ The following examples illustrate some concepts from Georgia Tech's research pap
 * **VisualISAMExample**: uses iSAM [TRO08]
 * **VisualISAM2Example**: uses iSAM2 [IJRR12]
 * **SFMExample_SmartFactor**: uses smartFactors [ICRA14]
+* **LidarISAM2Example**: uses iSAM2
 
 ## Kalman Filter Examples
 * **elaboratePoint2KalmanFilter**: simple linear Kalman filter on a moving 2D point, but done using factor graphs
