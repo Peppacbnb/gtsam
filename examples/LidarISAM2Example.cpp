@@ -11,7 +11,6 @@ It only needs to receive an odometry topic of type nav_msgs::Odometry with the n
 #include <geometry_msgs/PoseStamped.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/common/eigen.h>
-#include <pcl/filters/uniform_sampling.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <ros/ros.h>
 #include <tf/transform_datatypes.h>
@@ -22,17 +21,12 @@ It only needs to receive an odometry topic of type nav_msgs::Odometry with the n
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
-#include <gtsam/navigation/GPSFactor.h>
-#include <gtsam/navigation/ImuFactor.h>
-#include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/Marginals.h>
 #include <gtsam/nonlinear/Values.h>
-#include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/linear/NoiseModel.h>
-#include <utility>
 
 using namespace gtsam;
 
