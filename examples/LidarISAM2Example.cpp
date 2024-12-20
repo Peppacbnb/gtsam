@@ -28,19 +28,29 @@ It only needs to receive an odometry topic of type nav_msgs::Odometry with the n
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/linear/NoiseModel.h>
 
-using namespace gtsam;
+struct PointTypePose {
+    float x, y, z;          // Position
+    float intensity;        // Intensity (used as index)
+    float roll, pitch, yaw; // Orientation
+    double time;            // Timestamp
 
-//The definition of point cloud in LIO-SAM is used here, xyz,intensity,roll,pitch,yaw,time, contains most of the basic information.
-struct PointXYZIRPYT
-{
-    PCL_ADD_POINT4D
-    PCL_ADD_INTENSITY;                  // preferred way of adding a XYZ+padding
-    float roll;
-    float pitch;
-    float yaw;
-    double time;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW   // make sure our new allocators are aligned
-} EIGEN_ALIGN16;                    // enforce SSE padding for correct memory alignment
+    // Default constructor
+    PointTypePose() 
+        : x(0), y(0), z(0), intensity(0), roll(0), pitch(0), yaw(0), time(0) {}
+
+    // Custom constructor for initialization
+    PointTypePose(float _x, float _y, float _z, float _intensity,
+                  float _roll, float _pitch, float _yaw, double _time)
+        : x(_x), y(_y), z(_z), intensity(_intensity),
+          roll(_roll), pitch(_pitch), yaw(_yaw), time(_time) {}
+
+    // Constructor from Pose3
+    PointTypePose(const Pose3& pose, float _intensity, double _time)
+        : x(pose.translation().x()), y(pose.translation().y()), z(pose.translation().z()),
+          intensity(_intensity),
+          roll(pose.rotation().roll()), pitch(pose.rotation().pitch()), yaw(pose.rotation().yaw()),
+          time(_time) {}
+};
 
 POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
                                    (float, x, x) (float, y, y)
@@ -69,40 +79,34 @@ gtsam::Pose3 pclPointTogtsamPose3(PointTypePose thisPoint)
                                 gtsam::Point3(double(thisPoint.x),    double(thisPoint.y),     double(thisPoint.z)));
 }
 
-//Judging keyframes when the straight line distance is greater than 1 metre
-float surroundingkeyframeAddingDistThreshold = 1.0;
-// Judgement of keyframes when the angle is greater than 0.2 degrees
-float surroundingkeyframeAddingAngleThreshold = 0.2; 
 // Array of temporary point clouds
-float transformTobeMapped[6];
-//Searching for loopbacks requires greater than 10 seconds on both frames
-float historyKeyframeSearchRadius = 10.0;
+float gtransformTobeMapped[6];
+
 //Record radar time stamps
-ros::Time timeLaserInfoStamp;
+ros::Time gtimeLaserInfoStamp;
 //convert timestamp to second
-double timeLaserInfoCur;
+double gtimeLaserInfoCur;
 bool aLoopIsClosed = false;
 // Construct an empty non-linear factor graph
 NonlinearFactorGraph gtSAMgraph;  
 // Declare the initial values of the factor graph and the optimisation results
-Values initialEstimate; 
+Values ginitialEstimate; 
 
 /*
 The factor graph only models the history of SLAM poses and the relationship between inputs and observations; 
 how to solve this factor graph, i.e., how to set the variables in such a way that the whole graph best meets all the constraints (with minimum error) 
 requires the use of an optimizer. In addition to the most common Gaussian-Newton and Levenberg-Marquardt optimizers for solving nonlinear problems, 
 GTSAM implements two incremental optimizers, iSAM,iSAM2*/
-ISAM2 *isam; 
+ISAM2 *gisam; 
 //Store the optimisation results for each factor
-Values isamCurrentEstimate;
+Values gisamCurrentEstimate;
 //Optimisation of the set parameters, which can be adjusted in the main function
-ISAM2Params parameters; 
+ISAM2Params gparameters; 
 
 /*
 Publish optimised path
 */
 ros::Publisher path_pub; 
-nav_msgs::Path path;
 nav_msgs::Path globalPath;
 
 // Odometer retention queue
@@ -114,11 +118,11 @@ After turning on mBuf.lock() the main thread is locked until it finishes process
 std::mutex mBuf;
 
 //Historical keyframe position
-pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D(new pcl::PointCloud<PointType>);
-pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses3D(new pcl::PointCloud<PointType>);
+pcl::PointCloud<PointType>::Ptr gcloudKeyPoses3D(new pcl::PointCloud<PointType>);
+pcl::PointCloud<PointType>::Ptr copy_gcloudKeyPoses3D(new pcl::PointCloud<PointType>);
 //History keyframe poses
-pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>);
-pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>); 
+pcl::PointCloud<PointTypePose>::Ptr gcloudKeyPoses6D(new pcl::PointCloud<PointTypePose>);
+pcl::PointCloud<PointTypePose>::Ptr copy_gcloudKeyPoses6D(new pcl::PointCloud<PointTypePose>); 
 
 pcl::KdTreeFLANN<PointType>::Ptr kdtreeHistoryKeyPoses(new pcl::KdTreeFLANN<PointType>);
 
@@ -127,47 +131,51 @@ std::vector<std::pair<int, int>> loopIndexQueue; //Storing two loopback frames a
 std::vector<gtsam::Pose3> loopPoseQueue; //Stores the relative position between two loopback frames
 
 
-Eigen::Quaterniond q_w_curr(1, 0, 0, 0);
-Eigen::Vector3d t_w_curr(0, 0, 0);
-Eigen::Quaterniond q_wodom_curr(1, 0, 0, 0);
-Eigen::Vector3d t_wodom_curr(0, 0, 0);
+Eigen::Quaterniond g_q(1, 0, 0, 0);
+Eigen::Vector3d g_t(0, 0, 0);
+Eigen::Quaterniond g_q_odom(1, 0, 0, 0);
+Eigen::Vector3d g_t_odom(0, 0, 0);
 
 //Converts the received odometer positions into an array for temporary storage.
-void odomTotransform(Eigen::Quaterniond q_wodom_curr, Eigen::Vector3d t_wodom_curr)
+void odomTotransform(Eigen::Quaterniond g_q_odom, Eigen::Vector3d g_t_odom)
 {
-    Eigen::Vector3d euler = q_wodom_curr.toRotationMatrix().eulerAngles(2,1,0);
-    transformTobeMapped[0] = euler[0];
-    transformTobeMapped[1] = euler[1];
-    transformTobeMapped[2] = euler[2];    
-    transformTobeMapped[3] = t_wodom_curr[0];    
-    transformTobeMapped[4] = t_wodom_curr[1];
-    transformTobeMapped[5] = t_wodom_curr[2];
+    Eigen::Vector3d euler = g_q_odom.toRotationMatrix().eulerAngles(2,1,0);
+    gtransformTobeMapped[0] = euler[0];
+    gtransformTobeMapped[1] = euler[1];
+    gtransformTobeMapped[2] = euler[2];    
+    gtransformTobeMapped[3] = g_t_odom[0];    
+    gtransformTobeMapped[4] = g_t_odom[1];
+    gtransformTobeMapped[5] = g_t_odom[2];
 }
 
 //Determine the key frame, in order to prevent the first frame into the space pointer to report errors added a flag
-bool flag = 0;
-bool saveFrame(){
-    //If it is the first frame then there is no data in cloudkeyposes6D yet, and the data in the temporary storage array is used directly.
-    if(flag == 0)
+
+bool saveFrame()
+{
+    static bool flag = false;
+    //If it is the first frame then there is no data in gcloudkeyposes6D yet, and the data in the temporary storage array is used directly.
+    if(flag == false)
     {
-        PointTypePose ttt;
-        ttt.x = transformTobeMapped[3];
-        ttt.y = transformTobeMapped[4];
-        ttt.z = transformTobeMapped[5];
-        ttt.roll = transformTobeMapped[0];
-        ttt.pitch = transformTobeMapped[1];
-        ttt.yaw = transformTobeMapped[2];
-        cloudKeyPoses6D->push_back(ttt);
-        flag = 1;
+        //Use the constructor to create and add directly to gcloudKeyPoses6D
+        gcloudKeyPoses6D->push_back(PointTypePose(
+            gtransformTobeMapped[3], gtransformTobeMapped[4], gtransformTobeMapped[5], 0,  // x, y, z, intensity
+            gtransformTobeMapped[0], gtransformTobeMapped[1], gtransformTobeMapped[2], 0   // roll, pitch, yaw, time
+        ));
+        flag = true;
     }
     
     //The following calculates the angle and displacement between two neighboring frames, which are treated as keyframes if they are greater than a certain threshold.
-    Eigen::Affine3f transStart = pclPointToAffine3f(cloudKeyPoses6D->back());
-    Eigen::Affine3f transFinal = pcl::getTransformation(transformTobeMapped[3],
-        transformTobeMapped[4],transformTobeMapped[5],transformTobeMapped[0],transformTobeMapped[1],transformTobeMapped[2]);
+    Eigen::Affine3f transStart = pclPointToAffine3f(gcloudKeyPoses6D->back());
+    Eigen::Affine3f transFinal = pcl::getTransformation(gtransformTobeMapped[3],
+        gtransformTobeMapped[4],gtransformTobeMapped[5],gtransformTobeMapped[0],gtransformTobeMapped[1],gtransformTobeMapped[2]);
     Eigen::Affine3f transBetween = transStart.inverse() * transFinal;// Transfer matrix
     float x,y,z,roll,pitch,yaw;
     pcl::getTranslationAndEulerAngles(transBetween,x,y,z,roll,pitch,yaw);// transform the transfer matrix to xyz and Euler angles
+    
+    //Judging keyframes when the straight line distance is greater than 1 metre
+    float surroundingkeyframeAddingDistThreshold = 1.0;
+    // Judgement of keyframes when the angle is greater than 0.2 degrees
+    float surroundingkeyframeAddingAngleThreshold = 0.2; 
 
     if(abs(roll)  < surroundingkeyframeAddingAngleThreshold && 
         abs(pitch) < surroundingkeyframeAddingAngleThreshold && 
@@ -186,8 +194,10 @@ the closest spatial location (using kdtree for distance retrieval) and the time 
 */
 bool detectLoopClosureDistance(int *latestID, int *closestID)
 {
-    int loopKeyCur = copy_cloudKeyPoses3D->size() - 1;
+    int loopKeyCur = copy_gcloudKeyPoses3D->size() - 1;
     int loopKeyPre = -1;
+    
+    float historyKeyframeSearchRadius = 10.0; //Searching for loopbacks requires greater than 10 seconds on both frames
 
     auto it = loopIndexContainer.find(loopKeyCur);
     if(it != loopIndexContainer.end()){
@@ -196,15 +206,15 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
     //construct a kd tree for the keyframes in 3D bitmap and use the current frame position to find the closest frames from the kd tree, and pick the one with the farthest time interval as the matching frame
     std::vector<int> pointSearchIndLoop;
     std::vector<float> pointSearchSqDisLoop;
-    kdtreeHistoryKeyPoses -> setInputCloud(copy_cloudKeyPoses3D);
+    kdtreeHistoryKeyPoses -> setInputCloud(copy_gcloudKeyPoses3D);
     // Find keyframes with similar spatial distances   
-    kdtreeHistoryKeyPoses -> radiusSearch(copy_cloudKeyPoses3D -> back(),
+    kdtreeHistoryKeyPoses -> radiusSearch(copy_gcloudKeyPoses3D -> back(),
                                         historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 5 );
 
     for(int i = 0; i < (int)pointSearchIndLoop.size(); i++)
     {
         int id = pointSearchIndLoop[i];
-        if(abs(copy_cloudKeyPoses6D -> points[id].time - timeLaserInfoCur) > historyKeyframeSearchRadius)
+        if(abs(copy_gcloudKeyPoses6D -> points[id].time - gtimeLaserInfoCur) > historyKeyframeSearchRadius)
         {
             loopKeyPre = id;
             break;
@@ -228,13 +238,13 @@ bool detectLoopClosureDistance(int *latestID, int *closestID)
 //This function is a separate thread that keeps running all the time looking for it, and when it finds it, it pushes it into the loopindexqueue
 void performLoopClosure()
 {
-    if (cloudKeyPoses3D->points.empty() == true)
+    if (gcloudKeyPoses3D->points.empty() == true)
         return;
 
     /*The pointers to these two copies are the ones that will be used later in the detectLoopClosureDistance function.
-    Because cloudKeyPoses3D and 6D are constantly changing and updating while in use, a copy of the current state poses to detect*/
-    *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
-    *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+    Because gcloudKeyPoses3D and 6D are constantly changing and updating while in use, a copy of the current state poses to detect*/
+    *copy_gcloudKeyPoses3D = *gcloudKeyPoses3D;
+    *copy_gcloudKeyPoses6D = *gcloudKeyPoses6D;
 
     // find keys
     int loopKeyCur;
@@ -244,8 +254,8 @@ void performLoopClosure()
     
     /*The way to calculate the relative pose matrix is generally to give the pose of the two frames from the starting point, 
     and then use poseFrom.between(poseTo) to represent it in this way, because generally the current frame pose is calculated relative to the starting point.*/
-    gtsam::Pose3 poseFrom = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyCur]);
-    gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
+    gtsam::Pose3 poseFrom = pclPointTogtsamPose3(copy_gcloudKeyPoses6D->points[loopKeyCur]);
+    gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_gcloudKeyPoses6D->points[loopKeyPre]);
 
     loopIndexQueue.push_back(std::make_pair(loopKeyCur, loopKeyPre));
     loopPoseQueue.push_back(poseFrom.between(poseTo));   
@@ -261,16 +271,16 @@ void updateInitFialGuess(){
         std_msgs::Header frame_header = odometryBuf.front()->header;
 
         //Receive the latest frame of odometer information
-        q_wodom_curr.x() = odometryBuf.front()->pose.pose.orientation.x;
-        q_wodom_curr.y() = odometryBuf.front()->pose.pose.orientation.y;
-        q_wodom_curr.z() = odometryBuf.front()->pose.pose.orientation.z;
-        q_wodom_curr.w() = odometryBuf.front()->pose.pose.orientation.w;            
-        t_wodom_curr[0] = odometryBuf.front()->pose.pose.position.x;
-        t_wodom_curr[1] = odometryBuf.front()->pose.pose.position.y;
-        t_wodom_curr[2] = odometryBuf.front()->pose.pose.position.z;
+        g_q_odom.x() = odometryBuf.front()->pose.pose.orientation.x;
+        g_q_odom.y() = odometryBuf.front()->pose.pose.orientation.y;
+        g_q_odom.z() = odometryBuf.front()->pose.pose.orientation.z;
+        g_q_odom.w() = odometryBuf.front()->pose.pose.orientation.w;            
+        g_t_odom[0] = odometryBuf.front()->pose.pose.position.x;
+        g_t_odom[1] = odometryBuf.front()->pose.pose.position.y;
+        g_t_odom[2] = odometryBuf.front()->pose.pose.position.z;
         odometryBuf.pop();
 
-        odomTotransform(q_wodom_curr, t_wodom_curr);//Converted to matrix form for temporary storage
+        odomTotransform(g_q_odom, g_t_odom);//Converted to matrix form for temporary storage
         
         while(!odometryBuf.empty())
         {
@@ -301,35 +311,35 @@ void updatePath(const PointTypePose& pose_in){
 // set initial guess
 void RecordLastFrame()
 {
-    q_w_curr =  q_wodom_curr;
-    t_w_curr =  t_wodom_curr;
+    g_q =  g_q_odom;
+    g_t =  g_t_odom;
 }
 
 void addOdomFactor(){
-    Eigen::Vector3d r_w_last = q_w_curr.toRotationMatrix().eulerAngles(2,1,0);//Previous Frame Euler Angle
+    Eigen::Vector3d r_w_last = g_q.toRotationMatrix().eulerAngles(2,1,0);//Previous Frame Euler Angle
     gtsam::Rot3 rot_last = gtsam::Rot3::RzRyRx(r_w_last[0], r_w_last[1], r_w_last[2]);
-    Eigen::Vector3d t_w_last = t_w_curr;
+    Eigen::Vector3d t_w_last = g_t;
     
     RecordLastFrame();//This frame is recorded, and the relative position is calculated after the next frame is received.
 
-    Eigen::Vector3d r_w_curr = q_w_curr.toRotationMatrix().eulerAngles(2,1,0);//Current Frame Euler Angle
+    Eigen::Vector3d r_w_curr = g_q.toRotationMatrix().eulerAngles(2,1,0);//Current Frame Euler Angle
     gtsam::Rot3 rot_curr = gtsam::Rot3::RzRyRx(r_w_curr[0], r_w_curr[1], r_w_curr[2]);
     
     //There are two ways to join gtsamgraph, one is the first factor PriorFactor and the other is BetweenFactor between two variables
-    if(cloudKeyPoses3D->points.empty()){
+    if(gcloudKeyPoses3D->points.empty()){
         
         //Gaussian noise, representing our uncertainty about the factor
         noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector6(6) << 1e-2, 1e-2, M_PI*M_PI, 1e4, 1e4, 1e4).finished());
-        gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped),priorNoise));
-        initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));// Adding Initial Values to the Set of Initial Estimates
+        gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(gtransformTobeMapped),priorNoise));
+        ginitialEstimate.insert(0, trans2gtsamPose(gtransformTobeMapped));// Adding Initial Values to the Set of Initial Estimates
     }//Add the first factor
 
     else{//Insert odometer factor: relative position between two frames
             noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
             gtsam::Pose3 poseFrom(rot_last, t_w_last);
-            gtsam::Pose3 poseTo(rot_curr,t_w_curr);
-            gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
-            initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);// Adding Initial Values to the Set of Initial Estimates
+            gtsam::Pose3 poseTo(rot_curr,g_t);
+            gtSAMgraph.add(BetweenFactor<Pose3>(gcloudKeyPoses3D->size()-1, gcloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
+            ginitialEstimate.insert(gcloudKeyPoses3D->size(), poseTo);// Adding Initial Values to the Set of Initial Estimates
         }
 }
 
@@ -375,82 +385,81 @@ void saveKeyFrameAndFactor()
     Because the factor graph constructed by this code to show the optimization steps more simply has only the odometry factor and the loopback factor,
     none of the optimizations have any effect until the loopback factor is added.
     The following two optimizations will have no effect, but will be useful when adding e.g. IMU pre-integration factors and GPS factors.*/
-    isam->update(gtSAMgraph, initialEstimate);
-    isam->update();
+    gisam->update(gtSAMgraph, ginitialEstimate);
+    gisam->update();
 
     //5 optimizations when loopback factor is added
     if(aLoopIsClosed == true)
     {
-        isam->update();
-        isam->update();
-        isam->update();
-        isam->update();
-        isam->update();            
+        gisam->update();
+        gisam->update();
+        gisam->update();
+        gisam->update();
+        gisam->update();            
     }
 
     /*Clear the current factor map and initial values
     The factor graph has already been added to the optimizer, so it needs to be cleared in preparation for the next factor graph.*/
     gtSAMgraph.resize(0);
-    initialEstimate.clear();
+    ginitialEstimate.clear();
 
     //Save the result of the latest frame after optimization
     PointType thisPose3D;
-    PointTypePose thisPose6D;
     Pose3 latestEstimate;
-    
-    isamCurrentEstimate = isam->calculateEstimate();
-    latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
 
+    // Get the latest estimate from iSAM
+    gisamCurrentEstimate = gisam->calculateEstimate();
+    latestEstimate = gisamCurrentEstimate.at<Pose3>(gisamCurrentEstimate.size() - 1);
+
+    // Populate thisPose3D with translation data
     thisPose3D.x = latestEstimate.translation().x();
     thisPose3D.y = latestEstimate.translation().y();
     thisPose3D.z = latestEstimate.translation().z();
-    thisPose3D.intensity = cloudKeyPoses3D->size(); // this can be used as index
-    cloudKeyPoses3D->push_back(thisPose3D);
+    thisPose3D.intensity = gcloudKeyPoses3D->size(); // Use intensity as index
+    gcloudKeyPoses3D->push_back(thisPose3D);
 
-    thisPose6D.x = thisPose3D.x;
-    thisPose6D.y = thisPose3D.y;
-    thisPose6D.z = thisPose3D.z;
-    thisPose6D.intensity = thisPose3D.intensity ; // this can be used as index
-    thisPose6D.roll  = latestEstimate.rotation().roll();
-    thisPose6D.pitch = latestEstimate.rotation().pitch();
-    thisPose6D.yaw   = latestEstimate.rotation().yaw();
-    thisPose6D.time = timeLaserInfoCur;
-    cloudKeyPoses6D->push_back(thisPose6D);//Here push in to make sure the number of nodes in the queue is correct, and it will be updated again soon.
+    // Use the new constructor to create thisPose6D directly
+    PointTypePose thisPose6D(latestEstimate, thisPose3D.intensity, gtimeLaserInfoCur);
+    gcloudKeyPoses6D->push_back(thisPose6D);
+
+    // Update the global path
     updatePath(thisPose6D);
 
-    globalPath.header.stamp = timeLaserInfoStamp;
+    // Publish the global path
+    globalPath.header.stamp = gtimeLaserInfoStamp;
     globalPath.header.frame_id = "camera_init";
     path_pub.publish(globalPath);
+
 
 }
 
 //After optimization, all previously saved positions should be updated so that the new odometer positions are used when the loopback is calculated again later on.
 void correctPoses()
 {
-    if (cloudKeyPoses3D->points.empty())
+    if (gcloudKeyPoses3D->points.empty())
         return;
 
     if (aLoopIsClosed == true)
     {   
-        int numPoses = isamCurrentEstimate.size();
+        int numPoses = gisamCurrentEstimate.size();
         //You have to clear the path and republish each time
         globalPath.poses.clear();
         // update key poses
-        std::cout << "isamCurrentEstimate.size(): " << numPoses << std::endl;
+        std::cout << "gisamCurrentEstimate.size(): " << numPoses << std::endl;
         for (int i = 0; i < numPoses; ++i)
         {
-            cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-            cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-            cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+            gcloudKeyPoses3D->points[i].x = gisamCurrentEstimate.at<Pose3>(i).translation().x();
+            gcloudKeyPoses3D->points[i].y = gisamCurrentEstimate.at<Pose3>(i).translation().y();
+            gcloudKeyPoses3D->points[i].z = gisamCurrentEstimate.at<Pose3>(i).translation().z();
 
-            cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
-            cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
-            cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-            cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-            cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-            cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+            gcloudKeyPoses6D->points[i].x = gcloudKeyPoses3D->points[i].x;
+            gcloudKeyPoses6D->points[i].y = gcloudKeyPoses3D->points[i].y;
+            gcloudKeyPoses6D->points[i].z = gcloudKeyPoses3D->points[i].z;
+            gcloudKeyPoses6D->points[i].roll  = gisamCurrentEstimate.at<Pose3>(i).rotation().roll();
+            gcloudKeyPoses6D->points[i].pitch = gisamCurrentEstimate.at<Pose3>(i).rotation().pitch();
+            gcloudKeyPoses6D->points[i].yaw   = gisamCurrentEstimate.at<Pose3>(i).rotation().yaw();
 
-            updatePath(cloudKeyPoses6D->points[i]);
+            updatePath(gcloudKeyPoses6D->points[i]);
         }
 
         aLoopIsClosed = false;
@@ -477,8 +486,8 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &laserOdometry)
 	mBuf.lock();
 	odometryBuf.push(laserOdometry);
 	mBuf.unlock();
-    timeLaserInfoStamp = odometryBufBuf.front()->header.stamp;
-    timeLaserInfoCur = odometryBufBuf.front()->header.stamp.toSec();   
+    gtimeLaserInfoStamp = odometryBufBuf.front()->header.stamp;
+    gtimeLaserInfoCur = odometryBufBuf.front()->header.stamp.toSec();   
 }
 
 /*Main thread This thread is mainly responsible for performing radar-to-map matching to get a more accurate radar odometry, 
@@ -502,9 +511,9 @@ int main(int argc, char **argv)
 	ros::NodeHandle nh;
 
     //GTSAM optimized initial values
-    parameters.relinearizeThreshold = 0.1;
-    parameters.relinearizeSkip = 1;
-    isam = new ISAM2(parameters);
+    gparameters.relinearizeThreshold = 0.1;
+    gparameters.relinearizeSkip = 1;
+    gisam = new ISAM2(gparameters);
 
     std::thread loopthread(loopClosureThread);//circular thread
     std::thread run(running);//main thread
